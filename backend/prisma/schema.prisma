@@ -33,22 +33,24 @@ model User {
   role          Role
   createdAt     DateTime @default(now())
 
-  roomsCreated  Room[]         @relation("FacultyRooms")
-  memberships   RoomMember[]
-  submissions   Submission[]
+  roomsCreated     Room[]            @relation("FacultyRooms")
+  memberships      RoomMember[]
+  submissions      Submission[]
+  practicalRecords PracticalRecord[]
 }
 
 model Room {
-  id          String       @id @default(uuid())
-  code        String       @unique // short join code, e.g. "CS101-A3F9"
-  title       String
-  faculty     User         @relation("FacultyRooms", fields: [facultyId], references: [id])
-  facultyId   String
-  allowedHints Int         @default(3)
-  createdAt   DateTime     @default(now())
+  id           String   @id @default(uuid())
+  code         String   @unique
+  title        String
+  faculty      User     @relation("FacultyRooms", fields: [facultyId], references: [id])
+  facultyId    String
+  allowedHints Int      @default(3)
+  createdAt    DateTime @default(now())
 
-  members     RoomMember[]
-  problems    Problem[]
+  members          RoomMember[]
+  problems         Problem[]
+  practicalRecords PracticalRecord[]
 }
 
 model RoomMember {
@@ -72,11 +74,10 @@ model Problem {
   language    Language @default(C)
   createdAt   DateTime @default(now())
 
-  submissions Submission[]
+  submissions      Submission[]
+  practicalRecords PracticalRecord[]
 }
 
-// One submission = one "run" click by a student on a problem.
-// It can go through multiple attempts (recompiles after edits).
 model Submission {
   id         String   @id @default(uuid())
   user       User     @relation(fields: [userId], references: [id])
@@ -87,28 +88,28 @@ model Submission {
   status     AttemptStatus
   createdAt  DateTime @default(now())
 
-  attempts    Attempt[]
+  attempts Attempt[]
 }
 
 model Attempt {
-  id              String   @id @default(uuid())
+  id              String     @id @default(uuid())
   submission      Submission @relation(fields: [submissionId], references: [id])
   submissionId    String
-  compilerRawJson String     // raw gcc/clang -fdiagnostics-format=json output
-  errorCategory   String?    // syntax | type-mismatch | undeclared | linker | segfault | runtime | none
-  explanation     String?    // AI-generated plain-language explanation
+  compilerRawJson String
+  errorCategory   String?
+  explanation     String?
   resolved        Boolean    @default(false)
   createdAt       DateTime   @default(now())
 
-  hintUsages  HintUsage[]
-  aiPatch     AiPatch?
+  hintUsages HintUsage[]
+  aiPatch    AiPatch?
 }
 
 model HintUsage {
   id        String   @id @default(uuid())
   attempt   Attempt  @relation(fields: [attemptId], references: [id])
   attemptId String
-  level     Int      // 1, 2, 3
+  level     Int
   content   String
   createdAt DateTime @default(now())
 }
@@ -120,4 +121,27 @@ model AiPatch {
   patchDiff  String
   reasoning  String
   createdAt  DateTime @default(now())
+}
+
+model PracticalRecord {
+  id        String   @id @default(uuid())
+
+  student   User     @relation(fields: [studentId], references: [id])
+  studentId String
+
+  problem   Problem  @relation(fields: [problemId], references: [id])
+  problemId String
+
+  room      Room     @relation(fields: [roomId], references: [id])
+  roomId    String
+
+  code      String
+  output    String   @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, problemId])
+  @@index([studentId])
+  @@index([roomId])
 }
