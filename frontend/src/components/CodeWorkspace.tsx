@@ -65,18 +65,26 @@ export default function CodeWorkspace({
 }) {
   const langInfo = LANGUAGE_INFO[language] ?? LANGUAGE_INFO.C;
   const editorRef = useRef<any>(null);
+
   const [code, setCode] = useState(starterCode);
   const [result, setResult] = useState<SubmitResponse | null>(null);
   const [hints, setHints] = useState<{ level: number; content: string }[]>([]);
-  const [patch, setPatch] = useState<{ patchDiff: string; reasoning: string } | null>(null);
+  const [patch, setPatch] = useState<{
+    patchDiff: string;
+    reasoning: string;
+  } | null>(null);
   const [loading, setLoading] = useState(false);
   const [showRawOutput, setShowRawOutput] = useState(false);
-  const [interactiveSessionId, setInteractiveSessionId] = useState<string | null>(null);
+  const [interactiveSessionId, setInteractiveSessionId] = useState<string | null>(
+    null
+  );
   const [runOutput, setRunOutput] = useState("");
 
   const handleEditorMount: OnMount = (editor) => {
     editorRef.current = editor;
+
     const domNode = editor.getDomNode();
+
     domNode?.addEventListener("paste", (e) => e.preventDefault(), true);
     domNode?.addEventListener("copy", (e) => e.preventDefault(), true);
   };
@@ -94,11 +102,62 @@ export default function CodeWorkspace({
     [apiBase, authToken]
   );
 
+  /*
+   * Save a successfully executed practical.
+   *
+   * Important:
+   * This function is called ONLY after the program has completed
+   * successfully. Failed compilations or runtime failures are not saved.
+   */
+  async function saveSuccessfulPractical(
+    submissionId: string,
+    successfulCode: string,
+    output: string
+  ) {
+    try {
+      const response = await fetch(
+        `${apiBase}/api/practical-records/save`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({
+            submissionId,
+            code: successfulCode,
+            output,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        console.error("Failed to save practical:", data);
+        return;
+      }
+
+      console.log("Practical saved successfully.");
+    } catch (error) {
+      console.error("Error saving practical:", error);
+    }
+  }
+
   const handleInteractiveDone = useCallback(
-    (runResult: { stdout: string; stderr: string; crashed: boolean; timedOut: boolean }) => {
+    async (runResult: {
+      stdout: string;
+      stderr: string;
+      crashed: boolean;
+      timedOut: boolean;
+    }) => {
       const combined = runResult.stdout + runResult.stderr;
+
       setRunOutput(combined);
       setInteractiveSessionId(null);
+
+      const successful = !runResult.crashed && !runResult.timedOut;
+
       setResult((prev) =>
         prev
           ? {
@@ -107,12 +166,79 @@ export default function CodeWorkspace({
               stderr: runResult.stderr,
               crashed: runResult.crashed,
               timedOut: runResult.timedOut,
-              resolved: !runResult.crashed && !runResult.timedOut,
+              resolved: successful,
             }
           : prev
       );
+
+      /*
+       * Save ONLY when the interactive program finishes successfully.
+       *
+       * result is not used here because React state updates are asynchronous.
+       * We capture the submissionId from the previous result.
+       */
+      if (successful) {
+        // The submissionId is available from the result created by handleRun.
+        // We retrieve it from the latest result using the functional state
+        // update above in a separate safe callback below.
+      }
     },
     []
+  );
+
+  /*
+   * We use a ref to keep the latest successful submission information
+   * available to the interactive completion callback without depending
+   * on stale React state.
+   */
+  const submissionIdRef = useRef<string | null>(null);
+  const codeRef = useRef<string>(code);
+
+  codeRef.current = code;
+
+  /*
+   * Interactive run completion with saving.
+   *
+   * This second callback is used by the InteractiveConsole below.
+   */
+  const handleInteractiveDoneAndSave = useCallback(
+    async (runResult: {
+      stdout: string;
+      stderr: string;
+      crashed: boolean;
+      timedOut: boolean;
+    }) => {
+      const combined = runResult.stdout + runResult.stderr;
+      const successful = !runResult.crashed && !runResult.timedOut;
+
+      setRunOutput(combined);
+      setInteractiveSessionId(null);
+
+      setResult((prev) =>
+        prev
+          ? {
+              ...prev,
+              stdout: runResult.stdout,
+              stderr: runResult.stderr,
+              crashed: runResult.crashed,
+              timedOut: runResult.timedOut,
+              resolved: successful,
+            }
+          : prev
+      );
+
+      /*
+       * Only save a successful execution.
+       */
+      if (successful && submissionIdRef.current) {
+        await saveSuccessfulPractical(
+          submissionIdRef.current,
+          codeRef.current,
+          combined
+        );
+      }
+    },
+    [apiBase, authToken]
   );
 
   async function handleRun() {
@@ -122,13 +248,24 @@ export default function CodeWorkspace({
     setShowRawOutput(false);
     setInteractiveSessionId(null);
     setRunOutput("");
+
     try {
-      const data: SubmitResponse = await authedFetch("/api/compile/submit", {
-        problemId,
-        code,
-        interactive: true,
-      });
+      const data: SubmitResponse = await authedFetch(
+        "/api/compile/submit",
+        {
+          problemId,
+          code,
+          interactive: true,
+        }
+      );
+
       setResult(data);
+
+      /*
+       * Store the submission ID so that when the interactive console
+       * finishes, we can save the successful practical.
+       */
+      submissionIdRef.current = data.submissionId;
 
       if (data.interactive && data.sessionId) {
         setInteractiveSessionId(data.sessionId);
@@ -136,6 +273,7 @@ export default function CodeWorkspace({
 
       if (editorRef.current) {
         const monaco = (window as any).monaco;
+
         const markers = data.diagnostics.map((d) => ({
           startLineNumber: d.line,
           startColumn: d.column,
@@ -149,7 +287,30 @@ export default function CodeWorkspace({
               ? monaco.MarkerSeverity.Warning
               : monaco.MarkerSeverity.Info,
         }));
-        monaco.editor.setModelMarkers(editorRef.current.getModel(), "compiler", markers);
+
+        monaco.editor.setModelMarkers(
+          editorRef.current.getModel(),
+          "compiler",
+          markers
+        );
+      }
+
+      /*
+       * If the backend ever returns a normal successful result without
+       * starting an interactive session, save it immediately.
+       */
+      if (
+        data.resolved &&
+        !data.interactive &&
+        data.submissionId
+      ) {
+        const output = data.stdout + data.stderr;
+
+        await saveSuccessfulPractical(
+          data.submissionId,
+          code,
+          output
+        );
       }
     } finally {
       setLoading(false);
@@ -158,33 +319,63 @@ export default function CodeWorkspace({
 
   async function handleHint() {
     if (!result) return;
-    const data = await authedFetch("/api/help/hint", { attemptId: result.attemptId });
+
+    const data = await authedFetch("/api/help/hint", {
+      attemptId: result.attemptId,
+    });
+
     if (data.error) {
       alert(data.message ?? data.error);
       return;
     }
-    setHints((prev) => [...prev, { level: data.level, content: data.content }]);
+
+    setHints((prev) => [
+      ...prev,
+      {
+        level: data.level,
+        content: data.content,
+      },
+    ]);
   }
 
   async function handlePatch() {
     if (!result) return;
-    const data = await authedFetch("/api/help/ai-patch", { attemptId: result.attemptId });
+
+    const data = await authedFetch("/api/help/ai-patch", {
+      attemptId: result.attemptId,
+    });
+
     if (data.error) {
       alert(data.error);
       return;
     }
-    setPatch({ patchDiff: data.patchDiff, reasoning: data.reasoning });
+
+    setPatch({
+      patchDiff: data.patchDiff,
+      reasoning: data.reasoning,
+    });
   }
 
-  const primaryError = result?.diagnostics.find((d) => d.kind === "error");
-  const canRequestPatch = hints.length >= maxHints && !result?.resolved;
+  const primaryError = result?.diagnostics.find(
+    (d) => d.kind === "error"
+  );
+
+  const canRequestPatch =
+    hints.length >= maxHints && !result?.resolved;
 
   return (
     <div className="workspace-grid">
       <div className="editor-panel">
         <div className="editor-toolbar">
-          <span className="editor-toolbar-label">{langInfo.filename}</span>
-          <button className="btn-primary btn-run" onClick={handleRun} disabled={loading}>
+          <span className="editor-toolbar-label">
+            {langInfo.filename}
+          </span>
+
+          <button
+            className="btn-primary btn-run"
+            onClick={handleRun}
+            disabled={loading}
+          >
             {loading ? (
               <>
                 <span className="spinner" /> Compiling…
@@ -194,13 +385,18 @@ export default function CodeWorkspace({
             )}
           </button>
         </div>
+
         <Editor
           height="60vh"
           language={langInfo.monaco}
           value={code}
           onChange={(v) => setCode(v ?? "")}
           onMount={handleEditorMount}
-          options={{ minimap: { enabled: false }, fontSize: 14, padding: { top: 12 } }}
+          options={{
+            minimap: { enabled: false },
+            fontSize: 14,
+            padding: { top: 12 },
+          }}
         />
       </div>
 
@@ -208,21 +404,29 @@ export default function CodeWorkspace({
         {!result && (
           <div className="placeholder-panel">
             <div className="placeholder-icon">▶</div>
-            <p>Click <strong>Run</strong> to compile your code.</p>
+            <p>
+              Click <strong>Run</strong> to compile your code.
+            </p>
           </div>
         )}
 
         {result?.resolved && interactiveSessionId && (
           <div className="success-card">
             <div className="panel-header success">
-              <span className="status-icon success-icon">✓</span>
-              <span>Compiled successfully — enter input below</span>
+              <span className="status-icon success-icon">
+                ✓
+              </span>
+
+              <span>
+                Compiled successfully — enter input below
+              </span>
             </div>
+
             <InteractiveConsole
               sessionId={interactiveSessionId}
               authToken={authToken}
               apiBase={apiBase}
-              onDone={handleInteractiveDone}
+              onDone={handleInteractiveDoneAndSave}
             />
           </div>
         )}
@@ -230,125 +434,218 @@ export default function CodeWorkspace({
         {result?.resolved && !interactiveSessionId && (
           <div className="success-card">
             <div className="panel-header success">
-              <span className="status-icon success-icon">✓</span>
-              <span>Compiled and ran successfully</span>
+              <span className="status-icon success-icon">
+                ✓
+              </span>
+
+              <span>
+                Compiled and ran successfully
+              </span>
             </div>
+
             <div className="terminal-box">
-              <pre>{runOutput || result.stdout || "(no output)"}</pre>
+              <pre>
+                {runOutput ||
+                  result.stdout ||
+                  "(no output)"}
+              </pre>
             </div>
           </div>
         )}
 
-        {!result?.resolved && !primaryError && result && (
-          <div className="error-card">
-            <div className="panel-header error">
-              <span className="status-icon error-icon">!</span>
-              <div>
-                <div className="panel-title">
-                  {result.timedOut ? "Program timed out" : result.crashed ? "Program crashed" : "Runtime error"}
-                </div>
-                <div className="panel-subtitle">
-                  {result.timedOut
-                    ? "The program may be waiting for input or running too long."
-                    : "The program exited with an error."}
-                </div>
-              </div>
-            </div>
-            <div className="panel-body">
-              <div className="terminal-box terminal-box-error">
-                <pre>{result.stdout || result.stderr || "(no output)"}</pre>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {!result?.resolved && primaryError && (() => {
-          const err = primaryError;
-          return (
+        {!result?.resolved &&
+          !primaryError &&
+          result && (
             <div className="error-card">
               <div className="panel-header error">
-                <span className="status-icon error-icon">!</span>
+                <span className="status-icon error-icon">
+                  !
+                </span>
+
                 <div>
-                  <div className="panel-title">{CATEGORY_LABELS[err.category] ?? "Error"}</div>
-                  <div className="panel-subtitle">Line {err.line}, Col {err.column}</div>
+                  <div className="panel-title">
+                    {result.timedOut
+                      ? "Program timed out"
+                      : result.crashed
+                      ? "Program crashed"
+                      : "Runtime error"}
+                  </div>
+
+                  <div className="panel-subtitle">
+                    {result.timedOut
+                      ? "The program may be waiting for input or running too long."
+                      : "The program exited with an error."}
+                  </div>
                 </div>
               </div>
 
               <div className="panel-body">
-                <ErrorDiagram
-                  category={err.category}
-                  message={err.message}
-                  line={err.line}
-                  codeLine={code.split("\n")[err.line - 1] ?? ""}
-                />
-
-                {result?.explanation && (
-                  <div className="explain-box">
-                    <div className="explain-row">
-                      <span className="explain-label">What it means</span>
-                      <p>{result.explanation.plain_explanation}</p>
-                    </div>
-                    <div className="explain-row">
-                      <span className="explain-label">Why it happened here</span>
-                      <p>{result.explanation.why_it_happened}</p>
-                    </div>
-                    <div className="explain-row">
-                      <span className="explain-label">Concept</span>
-                      <p>{result.explanation.concept}</p>
-                    </div>
-                  </div>
-                )}
-
-                <button className="raw-toggle" onClick={() => setShowRawOutput((v) => !v)}>
-                  {showRawOutput ? "▾ Hide" : "▸ Show"} raw compiler output
-                </button>
-                {showRawOutput && (
-                  <div className="terminal-box terminal-box-error">
-                    <pre>{err.message}</pre>
-                  </div>
-                )}
-
-                {hints.length > 0 && (
-                  <div className="hint-timeline">
-                    {hints.map((h) => (
-                      <div key={h.level} className="hint-item">
-                        <span className="hint-badge">{h.level}</span>
-                        <p>{h.content}</p>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <div className="action-row">
-                  {!canRequestPatch && hints.length < maxHints && (
-                    <button className="btn-hint" onClick={handleHint}>
-                      💡 Need hint? <span className="hint-count">{hints.length}/{maxHints}</span>
-                    </button>
-                  )}
-
-                  {canRequestPatch && !patch && (
-                    <button className="btn-patch" onClick={handlePatch}>
-                      🔧 Show AI fix patch
-                    </button>
-                  )}
+                <div className="terminal-box terminal-box-error">
+                  <pre>
+                    {result.stdout ||
+                      result.stderr ||
+                      "(no output)"}
+                  </pre>
                 </div>
-
-                {patch && (
-                  <div className="patch-card">
-                    <div className="panel-header patch">
-                      <span className="status-icon patch-icon">✦</span>
-                      <span>AI-suggested fix</span>
-                    </div>
-                    <div className="terminal-box">
-                      <pre>{patch.patchDiff}</pre>
-                    </div>
-                    <p className="patch-reasoning">{patch.reasoning}</p>
-                  </div>
-                )}
               </div>
             </div>
-          );
-        })()}
+          )}
+
+        {!result?.resolved &&
+          primaryError &&
+          (() => {
+            const err = primaryError;
+
+            return (
+              <div className="error-card">
+                <div className="panel-header error">
+                  <span className="status-icon error-icon">
+                    !
+                  </span>
+
+                  <div>
+                    <div className="panel-title">
+                      {CATEGORY_LABELS[err.category] ??
+                        "Error"}
+                    </div>
+
+                    <div className="panel-subtitle">
+                      Line {err.line}, Col {err.column}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="panel-body">
+                  <ErrorDiagram
+                    category={err.category}
+                    message={err.message}
+                    line={err.line}
+                    codeLine={
+                      code.split("\n")[err.line - 1] ?? ""
+                    }
+                  />
+
+                  {result?.explanation && (
+                    <div className="explain-box">
+                      <div className="explain-row">
+                        <span className="explain-label">
+                          What it means
+                        </span>
+                        <p>
+                          {
+                            result.explanation
+                              .plain_explanation
+                          }
+                        </p>
+                      </div>
+
+                      <div className="explain-row">
+                        <span className="explain-label">
+                          Why it happened here
+                        </span>
+                        <p>
+                          {
+                            result.explanation
+                              .why_it_happened
+                          }
+                        </p>
+                      </div>
+
+                      <div className="explain-row">
+                        <span className="explain-label">
+                          Concept
+                        </span>
+                        <p>
+                          {result.explanation.concept}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    className="raw-toggle"
+                    onClick={() =>
+                      setShowRawOutput((v) => !v)
+                    }
+                  >
+                    {showRawOutput
+                      ? "▾ Hide"
+                      : "▸ Show"}{" "}
+                    raw compiler output
+                  </button>
+
+                  {showRawOutput && (
+                    <div className="terminal-box terminal-box-error">
+                      <pre>{err.message}</pre>
+                    </div>
+                  )}
+
+                  {hints.length > 0 && (
+                    <div className="hint-timeline">
+                      {hints.map((h) => (
+                        <div
+                          key={h.level}
+                          className="hint-item"
+                        >
+                          <span className="hint-badge">
+                            {h.level}
+                          </span>
+
+                          <p>{h.content}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="action-row">
+                    {!canRequestPatch &&
+                      hints.length < maxHints && (
+                        <button
+                          className="btn-hint"
+                          onClick={handleHint}
+                        >
+                          💡 Need hint?{" "}
+                          <span className="hint-count">
+                            {hints.length}/{maxHints}
+                          </span>
+                        </button>
+                      )}
+
+                    {canRequestPatch && !patch && (
+                      <button
+                        className="btn-patch"
+                        onClick={handlePatch}
+                      >
+                        🔧 Show AI fix patch
+                      </button>
+                    )}
+                  </div>
+
+                  {patch && (
+                    <div className="patch-card">
+                      <div className="panel-header patch">
+                        <span className="status-icon patch-icon">
+                          ✦
+                        </span>
+
+                        <span>
+                          AI-suggested fix
+                        </span>
+                      </div>
+
+                      <div className="terminal-box">
+                        <pre>{patch.patchDiff}</pre>
+                      </div>
+
+                      <p className="patch-reasoning">
+                        {patch.reasoning}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
       </div>
     </div>
   );

@@ -1,7 +1,11 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../db";
-import { requireAuth, requireRole, AuthedRequest } from "../middleware/auth";
+import {
+  requireAuth,
+  requireRole,
+  AuthedRequest,
+} from "../middleware/auth";
 
 export const roomsRouter = Router();
 
@@ -14,127 +18,438 @@ const createRoomSchema = z.object({
   allowedHints: z.number().int().min(0).max(10).optional(),
 });
 
-roomsRouter.post("/", requireAuth, requireRole("FACULTY"), async (req: AuthedRequest, res) => {
-  const parsed = createRoomSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+/*
+ * Faculty: create a new room
+ */
+roomsRouter.post(
+  "/",
+  requireAuth,
+  requireRole("FACULTY"),
+  async (req: AuthedRequest, res) => {
+    const parsed = createRoomSchema.safeParse(req.body);
 
-  const room = await prisma.room.create({
-    data: {
-      title: parsed.data.title,
-      allowedHints: parsed.data.allowedHints ?? 3,
-      facultyId: req.user!.id,
-      code: generateJoinCode(),
-    },
-  });
-  res.status(201).json(room);
-});
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: parsed.error.flatten(),
+      });
+    }
 
-// NEW: lets the faculty dashboard reload their rooms (with problem counts)
-// after a page refresh instead of losing everything from React state.
-roomsRouter.get("/mine", requireAuth, requireRole("FACULTY"), async (req: AuthedRequest, res) => {
-  const rooms = await prisma.room.findMany({
-    where: { facultyId: req.user!.id },
-    include: { problems: { select: { id: true, title: true, description: true, starterCode: true, language: true } } },
-    orderBy: { createdAt: "desc" },
-  });
-  res.json(rooms);
-});
-
-roomsRouter.post("/join/:code", requireAuth, requireRole("STUDENT"), async (req: AuthedRequest, res) => {
-  const room = await prisma.room.findUnique({ where: { code: req.params.code.toUpperCase() } });
-  if (!room) return res.status(404).json({ error: "Room not found" });
-
-  await prisma.roomMember.upsert({
-    where: { roomId_userId: { roomId: room.id, userId: req.user!.id } },
-    create: { roomId: room.id, userId: req.user!.id },
-    update: {},
-  });
-
-  res.json(room);
-});
-
-// Faculty dashboard: per-student progress across a room.
-roomsRouter.get("/:roomId/progress", requireAuth, requireRole("FACULTY"), async (req: AuthedRequest, res) => {
-  const room = await prisma.room.findUnique({ where: { id: req.params.roomId } });
-  if (!room || room.facultyId !== req.user!.id) return res.status(403).json({ error: "Not your room" });
-
-  const submissions = await prisma.submission.findMany({
-    where: { problem: { roomId: room.id } },
-    include: {
-      user: { select: { id: true, name: true } },
-      problem: { select: { id: true, title: true } },
-      attempts: {
-        include: { hintUsages: true, aiPatch: true },
-        orderBy: { createdAt: "asc" },
+    const room = await prisma.room.create({
+      data: {
+        title: parsed.data.title,
+        allowedHints: parsed.data.allowedHints ?? 3,
+        facultyId: req.user!.id,
+        code: generateJoinCode(),
       },
-    },
-  });
-
-  const byStudent: Record<string, any> = {};
-  for (const s of submissions) {
-    const key = s.user.id;
-    byStudent[key] ??= {
-      studentName: s.user.name,
-      problems: {},
-    };
-    const p = (byStudent[key].problems[s.problem.id] ??= {
-      title: s.problem.title,
-      status: s.status,
-      totalAttempts: 0,
-      hintsUsed: 0,
-      usedAiPatch: false,
-      errorCategoriesEncountered: new Set<string>(),
     });
-    p.status = s.status;
-    p.totalAttempts += s.attempts.length;
-    for (const a of s.attempts) {
-      p.hintsUsed += a.hintUsages.length;
-      if (a.aiPatch) p.usedAiPatch = true;
-      if (a.errorCategory) p.errorCategoriesEncountered.add(a.errorCategory);
+
+    res.status(201).json(room);
+  }
+);
+
+/*
+ * Faculty: get all rooms created by the logged-in faculty.
+ */
+roomsRouter.get(
+  "/mine",
+  requireAuth,
+  requireRole("FACULTY"),
+  async (req: AuthedRequest, res) => {
+    const rooms = await prisma.room.findMany({
+      where: {
+        facultyId: req.user!.id,
+      },
+      include: {
+        problems: {
+          select: {
+            id: true,
+            title: true,
+            description: true,
+            starterCode: true,
+            language: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    res.json(rooms);
+  }
+);
+
+/*
+ * Student: join a room using its join code.
+ */
+roomsRouter.post(
+  "/join/:code",
+  requireAuth,
+  requireRole("STUDENT"),
+  async (req: AuthedRequest, res) => {
+    const room = await prisma.room.findUnique({
+      where: {
+        code: req.params.code.toUpperCase(),
+      },
+    });
+
+    if (!room) {
+      return res.status(404).json({
+        error: "Room not found",
+      });
+    }
+
+    await prisma.roomMember.upsert({
+      where: {
+        roomId_userId: {
+          roomId: room.id,
+          userId: req.user!.id,
+        },
+      },
+      create: {
+        roomId: room.id,
+        userId: req.user!.id,
+      },
+      update: {},
+    });
+
+    res.json(room);
+  }
+);
+
+/*
+ * Student: get ALL rooms joined by the logged-in student.
+ *
+ * This is used by the Student Dashboard.
+ *
+ * It also returns:
+ * - total number of practicals/problems
+ * - number of completed practicals
+ */
+roomsRouter.get(
+  "/student",
+  requireAuth,
+  requireRole("STUDENT"),
+  async (req: AuthedRequest, res) => {
+    try {
+      const rooms = await prisma.room.findMany({
+        where: {
+          members: {
+            some: {
+              userId: req.user!.id,
+            },
+          },
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+        include: {
+          _count: {
+            select: {
+              problems: true,
+            },
+          },
+          problems: {
+            select: {
+              id: true,
+              practicalRecords: {
+                where: {
+                  studentId: req.user!.id,
+                },
+                select: {
+                  id: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const result = rooms.map((room) => {
+        const completedCount = room.problems.filter(
+          (problem) => problem.practicalRecords.length > 0
+        ).length;
+
+        return {
+          id: room.id,
+          title: room.title,
+          code: room.code,
+          createdAt: room.createdAt,
+          problemCount: room._count.problems,
+          completedCount,
+        };
+      });
+
+      return res.json(result);
+    } catch (error) {
+      console.error(
+        "Error fetching student rooms:",
+        error
+      );
+
+      return res.status(500).json({
+        error: "Failed to fetch joined rooms.",
+      });
     }
   }
+);
 
-  for (const student of Object.values(byStudent) as any[]) {
-    for (const problem of Object.values(student.problems) as any[]) {
-      problem.errorCategoriesEncountered = Array.from(problem.errorCategoriesEncountered);
+/*
+ * Faculty: per-student progress across a room.
+ */
+roomsRouter.get(
+  "/:roomId/progress",
+  requireAuth,
+  requireRole("FACULTY"),
+  async (req: AuthedRequest, res) => {
+    const room = await prisma.room.findUnique({
+      where: {
+        id: req.params.roomId,
+      },
+    });
+
+    if (!room || room.facultyId !== req.user!.id) {
+      return res.status(403).json({
+        error: "Not your room",
+      });
     }
+
+    const submissions = await prisma.submission.findMany({
+      where: {
+        problem: {
+          roomId: room.id,
+        },
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        problem: {
+          select: {
+            id: true,
+            title: true,
+          },
+        },
+        attempts: {
+          include: {
+            hintUsages: true,
+            aiPatch: true,
+          },
+          orderBy: {
+            createdAt: "asc",
+          },
+        },
+      },
+    });
+
+    const byStudent: Record<string, any> = {};
+
+    for (const s of submissions) {
+      const key = s.user.id;
+
+      byStudent[key] ??= {
+        studentName: s.user.name,
+        problems: {},
+      };
+
+      const p = (byStudent[key].problems[s.problem.id] ??= {
+        title: s.problem.title,
+        status: s.status,
+        totalAttempts: 0,
+        hintsUsed: 0,
+        usedAiPatch: false,
+        errorCategoriesEncountered:
+          new Set<string>(),
+      });
+
+      p.status = s.status;
+      p.totalAttempts += s.attempts.length;
+
+      for (const a of s.attempts) {
+        p.hintsUsed += a.hintUsages.length;
+
+        if (a.aiPatch) {
+          p.usedAiPatch = true;
+        }
+
+        if (a.errorCategory) {
+          p.errorCategoriesEncountered.add(
+            a.errorCategory
+          );
+        }
+      }
+    }
+
+    for (const student of Object.values(
+      byStudent
+    ) as any[]) {
+      for (const problem of Object.values(
+        student.problems
+      ) as any[]) {
+        problem.errorCategoriesEncountered =
+          Array.from(
+            problem.errorCategoriesEncountered
+          );
+      }
+    }
+
+    res.json(byStudent);
   }
+);
 
-  res.json(byStudent);
-},
+/*
+ * Faculty: delete a room and everything under it.
+ *
+ * PracticalRecord is deleted first because it references
+ * the room and problem.
+ */
+roomsRouter.delete(
+  "/:roomId",
+  requireAuth,
+  requireRole("FACULTY"),
+  async (req: AuthedRequest, res) => {
+    const room = await prisma.room.findUnique({
+      where: {
+        id: req.params.roomId,
+      },
+    });
 
-// Deletes a room and everything under it (problems, submissions, attempts,
-// hints, patches) via cascading deletes driven from the DB relations.
-roomsRouter.delete("/:roomId", requireAuth, requireRole("FACULTY"), async (req: AuthedRequest, res) => {
-  const room = await prisma.room.findUnique({ where: { id: req.params.roomId } });
-  if (!room) return res.status(404).json({ error: "Room not found" });
-  if (room.facultyId !== req.user!.id) return res.status(403).json({ error: "Not your room" });
+    if (!room) {
+      return res.status(404).json({
+        error: "Room not found",
+      });
+    }
 
-  const problems = await prisma.problem.findMany({ where: { roomId: room.id }, select: { id: true } });
-  const problemIds = problems.map((p) => p.id);
+    if (room.facultyId !== req.user!.id) {
+      return res.status(403).json({
+        error: "Not your room",
+      });
+    }
 
-  const submissions = await prisma.submission.findMany({
-    where: { problemId: { in: problemIds } },
-    select: { id: true },
-  });
-  const submissionIds = submissions.map((s) => s.id);
+    const problems = await prisma.problem.findMany({
+      where: {
+        roomId: room.id,
+      },
+      select: {
+        id: true,
+      },
+    });
 
-  const attempts = await prisma.attempt.findMany({
-    where: { submissionId: { in: submissionIds } },
-    select: { id: true },
-  });
-  const attemptIds = attempts.map((a) => a.id);
+    const problemIds = problems.map(
+      (p) => p.id
+    );
 
-  // Prisma's schema here has no onDelete: Cascade set, so we delete
-  // bottom-up manually to avoid foreign key violations.
-  await prisma.hintUsage.deleteMany({ where: { attemptId: { in: attemptIds } } });
-  await prisma.aiPatch.deleteMany({ where: { attemptId: { in: attemptIds } } });
-  await prisma.attempt.deleteMany({ where: { id: { in: attemptIds } } });
-  await prisma.submission.deleteMany({ where: { id: { in: submissionIds } } });
-  await prisma.problem.deleteMany({ where: { id: { in: problemIds } } });
-  await prisma.roomMember.deleteMany({ where: { roomId: room.id } });
-  await prisma.room.delete({ where: { id: room.id } });
+    const submissions =
+      problemIds.length > 0
+        ? await prisma.submission.findMany({
+            where: {
+              problemId: {
+                in: problemIds,
+              },
+            },
+            select: {
+              id: true,
+            },
+          })
+        : [];
 
-  res.json({ success: true });
-})
+    const submissionIds = submissions.map(
+      (s) => s.id
+    );
+
+    const attempts =
+      submissionIds.length > 0
+        ? await prisma.attempt.findMany({
+            where: {
+              submissionId: {
+                in: submissionIds,
+              },
+            },
+            select: {
+              id: true,
+            },
+          })
+        : [];
+
+    const attemptIds = attempts.map(
+      (a) => a.id
+    );
+
+    /*
+     * Delete practical records first.
+     */
+    await prisma.practicalRecord.deleteMany({
+      where: {
+        roomId: room.id,
+      },
+    });
+
+    /*
+     * Delete child records bottom-up.
+     */
+    if (attemptIds.length > 0) {
+      await prisma.hintUsage.deleteMany({
+        where: {
+          attemptId: {
+            in: attemptIds,
+          },
+        },
+      });
+
+      await prisma.aiPatch.deleteMany({
+        where: {
+          attemptId: {
+            in: attemptIds,
+          },
+        },
+      });
+
+      await prisma.attempt.deleteMany({
+        where: {
+          id: {
+            in: attemptIds,
+          },
+        },
+      });
+    }
+
+    if (submissionIds.length > 0) {
+      await prisma.submission.deleteMany({
+        where: {
+          id: {
+            in: submissionIds,
+          },
+        },
+      });
+    }
+
+    if (problemIds.length > 0) {
+      await prisma.problem.deleteMany({
+        where: {
+          id: {
+            in: problemIds,
+          },
+        },
+      });
+    }
+
+    await prisma.roomMember.deleteMany({
+      where: {
+        roomId: room.id,
+      },
+    });
+
+    await prisma.room.delete({
+      where: {
+        id: room.id,
+      },
+    });
+
+    res.json({
+      success: true,
+    });
+  }
 );
